@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -71,7 +71,11 @@ test("discovers main Codex and Pi sessions while excluding internal sessions", a
       cwd,
     });
 
-    const result = await discoverLocalSessions({ homeDir: root, env: {} });
+    const result = await discoverLocalSessions({
+      homeDir: root,
+      env: {},
+      scope: { projects: [cwd], providers: ["pi", "codex"] },
+    });
 
     assert.deepEqual(
       result.sessions
@@ -161,6 +165,7 @@ test("imports only unregistered sessions", async () => {
     const result = await syncLocalSessions({
       homeDir: root,
       env: {},
+      scope: { projects: [cwd], providers: ["pi", "codex"] },
       batchSize: 10,
       importSession: async (session) => {
         imported.push(session.sessionId);
@@ -204,6 +209,7 @@ test("limits each sync batch and defers active Codex writers", async () => {
     const result = await syncLocalSessions({
       homeDir: root,
       env: {},
+      scope: { projects: [cwd], providers: ["pi", "codex"] },
       batchSize: 2,
       importSession: async () => {
         attempts += 1;
@@ -222,7 +228,7 @@ test("limits each sync batch and defers active Codex writers", async () => {
   }
 });
 
-test("deletes dangling agents and archives only newly empty workspaces", async () => {
+test("never deletes dangling agents or archives existing workspaces", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "paseo-auto-sync-"));
   try {
     const codexSessions = path.join(
@@ -310,27 +316,23 @@ test("deletes dangling agents and archives only newly empty workspaces", async (
       ),
     );
 
-    const deleted: string[] = [];
-    const archived: string[] = [];
     const result = await syncLocalSessions({
       homeDir: root,
       env: {},
+      scope: { projects: [root], providers: ["pi", "codex"] },
       importSession: async () => {
         assert.fail("invalid-cwd session must not be imported");
       },
-      deleteAgent: async (agentId) => {
-        deleted.push(agentId);
-      },
-      archiveWorkspace: async (workspaceId) => {
-        archived.push(workspaceId);
-      },
     });
 
-    assert.deepEqual(deleted.sort(), ["pi-orphan", "pi-shared-orphan"]);
-    assert.deepEqual(archived, ["workspace-orphan"]);
-    assert.equal(result.deletedDangling.pi, 2);
-    assert.equal(result.skippedRunningDangling.codex, 1);
-    assert.equal(result.archivedEmptyWorkspaces, 1);
+    for (const record of records) {
+      assert.deepEqual(
+        JSON.parse(await readFile(path.join(agents, `${record.id}.json`), "utf8")),
+        record,
+      );
+    }
+    assert.deepEqual(result.deletedDangling, { pi: 0, codex: 0 });
+    assert.equal(result.archivedEmptyWorkspaces, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

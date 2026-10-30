@@ -2,86 +2,64 @@
 
 [中文](README.zh-CN.md)
 
-Paseo plugin that imports local Codex and Pi sessions and removes Paseo records
-whose provider sessions no longer exist. It follows Gaseo's link-not-copy model:
-original JSONL transcripts remain in their provider directories, while Paseo
-stores the provider session handle needed to resume them.
+An import-only fork of [hsiangron/paseo-auto-sync](https://github.com/hsiangron/paseo-auto-sync). Registers local Pi (optionally Codex) sessions in Paseo using original JSONL handles, without copying transcripts.
 
-## Behavior
+## Fork behavior
 
-- Syncs when the server plugin starts, when a Paseo client loads, and every 24
-  hours while the daemon stays running.
-- Hard-deletes idle or closed Paseo agents when their Pi/Codex native session no
-  longer exists. Running agents are never deleted.
-- Archives a workspace only when cleanup successfully deletes every agent it
-  contained, so shared workspaces remain active.
-- Concurrent triggers from multiple windows are merged into a single in-flight
-  sync.
-- Creates one Paseo workspace per imported session so it appears in the
-  sidebar. A bare `paseo import` would place every session into the oldest
-  workspace for that folder.
-- Treats active and archived Paseo agents as registered, so archived sessions
-  are not recreated on the next launch.
-- Imports main sessions from `~/.codex/sessions` and `~/.codex/archived_sessions`.
-  Codex `exec` / subagent records and Pi `forks` or `run-*/session.jsonl` files
-  are skipped.
-- Skips sessions whose original working directory no longer exists on this host.
-- Codex sessions that currently have an active writer are deferred and retried
-  on the next sync.
-- Labels agents created by the plugin with `paseo-auto-sync=true`.
-- Adds **Sync local Codex and Pi sessions** in the Command Center for a manual
-  retry.
+- Never deletes existing agents or archives existing workspaces because native sessions are missing.
+- Requires an explicit project whitelist. Missing/empty settings import nothing; invalid settings fail closed.
+- Exact normalized cwd matching: children, similarly named directories and worktrees are not implicitly included.
+- Pi only by default; Codex is opt-in.
+- Checks at server startup, client load and every **30 seconds**. Scope settings are reread each sync.
+- Deduplicates active and archived agents; does not resurrect archived sessions.
+- Creates one visible workspace per imported session. On import failure, only the empty workspace created by that attempt is archived.
+- Skips internal Pi forks/run sessions, Codex exec/subagents and missing working directories. Active Codex writers are deferred.
+- Imports at most 50 sessions per sync, newest first, without sending prompts.
+- Adds **Sync local Codex and Pi sessions** to the Command Center.
 
-## Resource limits
-
-Every imported session can keep a provider runtime alive until the Paseo daemon
-unloads it. To avoid starting dozens of `codex app-server` processes on first
-install, each sync imports at most **50** new sessions by default, newest first.
-Remaining sessions are imported on later launches or a Command Center retry.
-
-Set `PASEO_AUTO_SYNC_BATCH_SIZE` to a value from `1` to `50` to change the
-batch size.
-
-After a large first-time import, `paseo daemon restart` releases those runtimes
-without deleting the imported agent records. Do not restart while other agents
-are still working.
+Importing may start provider runtimes. Registration is not a guarantee of live refresh when a local Pi process appends messages. Avoid concurrently operating the same native session in Pi and Paseo.
 
 ## Install
 
-Keep the plugin inside the Paseo home, not as a sibling checkout in `$HOME`:
+Requires Paseo **0.13.2 or newer**. Workspace import uses CLI internals; revalidate compatibility after Paseo updates.
 
 ```bash
-git clone https://github.com/hsiangron/paseo-auto-sync.git ~/.paseo/plugins/paseo-auto-sync
+git clone https://github.com/K23Flux/paseo-auto-sync.git ~/.paseo/plugins/paseo-auto-sync
 cd ~/.paseo/plugins/paseo-auto-sync
-npm install
+npm ci --ignore-scripts
+npm test
+npm run typecheck
 paseo plugin install ~/.paseo/plugins/paseo-auto-sync
 ```
 
-Reload the plugin after local edits:
+Dependencies are for development/testing; runtime modules are host-provided. After local changes:
 
 ```bash
 paseo plugin reload paseo-auto-sync
+paseo plugin logs paseo-auto-sync
 ```
 
-## Configuration
+## Local project whitelist
 
-The plugin reads these environment variables. Unset values use the defaults
-below.
+Create `~/.paseo/plugin-data/paseo-auto-sync/config.json` (relative to `PASEO_HOME` if customized). Keep machine-specific paths private and out of Git:
+
+```json
+{
+  "projects": ["~/Projects/my-project"],
+  "providers": ["pi"]
+}
+```
+
+`projects` accepts absolute or `~/` paths. `providers` accepts `pi` and/or `codex`, defaults to `pi`; an empty array enables neither provider.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CODEX_HOME` | `~/.codex` | Codex home; sessions are read from `$CODEX_HOME/sessions` and `$CODEX_HOME/archived_sessions` |
+| `CODEX_HOME` | `~/.codex` | Codex home |
 | `PI_CODING_AGENT_DIR` | `~/.pi/agent` | Pi agent directory |
-| `PI_CODING_AGENT_SESSION_DIR` | `$PI_CODING_AGENT_DIR/sessions` | Pi session JSONL root |
-| `PASEO_HOME` | `~/.paseo` | Paseo data directory used for active/archived dedupe |
-| `PASEO_CLI` | `paseo` on `PATH`, then common install locations | CLI used to import sessions and remove dangling Paseo records |
-| `PASEO_AUTO_SYNC_BATCH_SIZE` | `50` (`1`–`50`) | Max new sessions imported per sync |
-| `PASEO_AUTO_SYNC_INTERVAL_HOURS` | `24` (`1`–`168`) | Interval for periodic sync and dangling-session cleanup |
+| `PI_CODING_AGENT_SESSION_DIR` | `$PI_CODING_AGENT_DIR/sessions` | Pi JSONL root |
+| `PASEO_HOME` | `~/.paseo` | Paseo data and local scope settings root |
+| `PASEO_CLI` | PATH, then standard locations | Paseo CLI used for import |
+| `PASEO_AUTO_SYNC_BATCH_SIZE` | `50` | Max imports per sync, 1–50 |
+| `PASEO_AUTO_SYNC_INTERVAL_SECONDS` | `30` | Periodic interval, 30–86400 seconds |
 
-## Development
-
-```bash
-npm install
-npm test
-npm run typecheck
-```
+This fork no longer uses `PASEO_AUTO_SYNC_INTERVAL_HOURS` or performs dangling-session cleanup. Disable the plugin to stop syncing; imported records and native transcripts remain intact.

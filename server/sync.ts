@@ -12,8 +12,8 @@ const AUTO_SYNC_LABEL = "paseo-auto-sync=true";
 const IMPORT_TIMEOUT_MS = 120_000;
 const DEFAULT_IMPORT_BATCH_SIZE = 50;
 const MAX_IMPORT_BATCH_SIZE = 50;
-const DEFAULT_SYNC_INTERVAL_HOURS = 24;
-const MAX_SYNC_INTERVAL_HOURS = 168;
+const DEFAULT_SYNC_INTERVAL_SECONDS = 30;
+const MAX_SYNC_INTERVAL_SECONDS = 86400;
 
 // Codex rollout 文件名以 session UUID 结尾；首行损坏时仍可据此确认原生会话存在。
 const CODEX_SESSION_ID_SUFFIX =
@@ -56,33 +56,19 @@ export interface SyncResult {
   workspaceArchiveFailed: number;
 }
 
-interface RegisteredAgent {
-  id: string;
-  provider: Provider;
-  workspaceId?: string;
-  sessionId?: string;
-  nativeHandle?: string;
-  lastStatus?: string;
-}
-
-interface RegisteredSessions {
-  agents: RegisteredAgent[];
-  keys: Set<string>;
-  workspaceAgentCounts: Map<string, number>;
+export interface SyncScope {
+  projects: string[];
+  providers?: Provider[];
 }
 
 interface SyncOptions {
+  scope?: SyncScope;
   env?: NodeJS.ProcessEnv;
   homeDir?: string;
   signal?: AbortSignal;
   batchSize?: number;
   importSession?: (
     session: LocalSession,
-    signal?: AbortSignal,
-  ) => Promise<void>;
-  deleteAgent?: (agentId: string, signal?: AbortSignal) => Promise<void>;
-  archiveWorkspace?: (
-    workspaceId: string,
     signal?: AbortSignal,
   ) => Promise<void>;
 }
@@ -125,7 +111,7 @@ export function createSessionSyncController(): SessionSyncController {
   };
   const timer = setInterval(
     trigger,
-    resolveSyncIntervalMs(process.env.PASEO_AUTO_SYNC_INTERVAL_HOURS),
+    resolveSyncIntervalMs(process.env.PASEO_AUTO_SYNC_INTERVAL_SECONDS),
   );
   timer.unref();
 
@@ -165,13 +151,36 @@ export async function discoverLocalSessions(
     homeDir,
   );
 
+  const scope = validateScope(
+    options.scope ?? (await readSyncScope(env, homeDir)),
+    homeDir,
+  );
+  // Missing or empty project configuration is fail-closed: import nothing.
+  if (scope.projects.length === 0) {
+    return {
+      sessions: [],
+      skippedInvalid: { codex: 0, pi: 0 },
+      existingKeys: new Set(),
+    };
+  }
+  const empty = () => ({
+    sessions: [] as LocalSession[],
+    skippedInvalid: 0,
+    existingKeys: new Set<string>(),
+  });
   const [codexLive, codexArchived, pi] = await Promise.all([
-    discoverCodexSessions(path.join(codexHome, "sessions"), options.signal),
-    discoverCodexSessions(
-      path.join(codexHome, "archived_sessions"),
-      options.signal,
-    ),
-    discoverPiSessions(piSessionsDir, options.signal),
+    scope.providers.includes("codex")
+      ? discoverCodexSessions(path.join(codexHome, "sessions"), options.signal)
+      : empty(),
+    scope.providers.includes("codex")
+      ? discoverCodexSessions(
+          path.join(codexHome, "archived_sessions"),
+          options.signal,
+        )
+      : empty(),
+    scope.providers.includes("pi")
+      ? discoverPiSessions(piSessionsDir, options.signal)
+      : empty(),
   ]);
 
   const sessionsByKey = new Map<string, LocalSession>();
@@ -180,6 +189,9 @@ export async function discoverLocalSessions(
     ...codexArchived.sessions,
     ...pi.sessions,
   ]) {
+    if (!scope.projects.includes(path.resolve(session.cwd))) {
+      continue;
+    }
     const key = sessionKey(session.provider, session.providerHandleId);
     const current = sessionsByKey.get(key);
     if (!current || current.modifiedAt < session.modifiedAt) {
@@ -205,36 +217,23 @@ export async function discoverLocalSessions(
   };
 }
 
-async function readRegisteredSessions(
+/** Read active and archived native handles without modifying Paseo records. */
+export async function readRegisteredSessionKeys(
   paseoHome: string,
-): Promise<RegisteredSessions> {
+): Promise<Set<string>> {
   const agentFiles = await walkFiles(path.join(paseoHome, "agents"), ".json");
-  const agents: RegisteredAgent[] = [];
   const keys = new Set<string>();
-  const workspaceAgentCounts = new Map<string, number>();
 
   await Promise.all(
     agentFiles.map(async (file) => {
       try {
         const record = JSON.parse(await readFile(file, "utf8")) as {
-          id?: unknown;
-          workspaceId?: unknown;
-          lastStatus?: unknown;
           persistence?: {
             provider?: unknown;
             sessionId?: unknown;
             nativeHandle?: unknown;
           } | null;
         };
-        if (
-          typeof record.id === "string" &&
-          typeof record.workspaceId === "string"
-        ) {
-          workspaceAgentCounts.set(
-            record.workspaceId,
-            (workspaceAgentCounts.get(record.workspaceId) ?? 0) + 1,
-          );
-        }
         const provider = record.persistence?.provider;
         if (provider !== "codex" && provider !== "pi") {
           return;
@@ -253,42 +252,13 @@ async function readRegisteredSessions(
         if (nativeHandle) {
           keys.add(sessionKey(provider, nativeHandle));
         }
-        if (typeof record.id !== "string") {
-          return;
-        }
-        agents.push({
-          id: record.id,
-          provider,
-          workspaceId:
-            typeof record.workspaceId === "string"
-              ? record.workspaceId
-              : undefined,
-          sessionId,
-          nativeHandle,
-          lastStatus:
-            typeof record.lastStatus === "string"
-              ? record.lastStatus
-              : undefined,
-        });
       } catch {
         // 单个损坏记录不应触发删除，也不应阻断其他会话同步。
       }
     }),
   );
 
-  return { agents, keys, workspaceAgentCounts };
-}
-
-/**
- * 读取 Paseo 已保存的 active 与 archived agent，生成原生 session 去重键。
- *
- * @param paseoHome Paseo 数据目录，默认由调用方按环境解析。
- * @returns 已在 Paseo 中存在的 provider/session 组合。
- */
-export async function readRegisteredSessionKeys(
-  paseoHome: string,
-): Promise<Set<string>> {
-  return (await readRegisteredSessions(paseoHome)).keys;
+  return keys;
 }
 
 /**
@@ -309,12 +279,9 @@ export async function syncLocalSessions(
   );
   const [discovery, registered] = await Promise.all([
     discoverLocalSessions({ ...options, env, homeDir }),
-    readRegisteredSessions(paseoHome),
+    readRegisteredSessionKeys(paseoHome),
   ]);
   const importSession = options.importSession ?? importWithPaseoCli;
-  const deleteAgent = options.deleteAgent ?? deleteWithPaseoCli;
-  const archiveWorkspace =
-    options.archiveWorkspace ?? archiveWorkspaceWithPaseoCli;
   const result = createEmptyResult(discovery.skippedInvalid);
   const batchSize = resolveBatchSize(
     options.batchSize,
@@ -322,15 +289,8 @@ export async function syncLocalSessions(
   );
   let attemptedImports = 0;
 
-  await cleanupDanglingAgents(
-    registered.agents,
-    registered.workspaceAgentCounts,
-    discovery.existingKeys,
-    deleteAgent,
-    archiveWorkspace,
-    result,
-    options.signal,
-  );
+  // This fork is import-only. Missing native files never delete or archive
+  // existing Paseo agents/workspaces, including records outside the scope.
 
   for (const session of discovery.sessions) {
     throwIfAborted(options.signal);
@@ -338,7 +298,7 @@ export async function syncLocalSessions(
 
     const handleKey = sessionKey(session.provider, session.providerHandleId);
     const idKey = sessionKey(session.provider, session.sessionId);
-    if (registered.keys.has(handleKey) || registered.keys.has(idKey)) {
+    if (registered.has(handleKey) || registered.has(idKey)) {
       result.skippedRegistered[session.provider] += 1;
       continue;
     }
@@ -351,16 +311,16 @@ export async function syncLocalSessions(
     attemptedImports += 1;
     try {
       await importSession(session, options.signal);
-      registered.keys.add(handleKey);
-      registered.keys.add(idKey);
+      registered.add(handleKey);
+      registered.add(idKey);
       result.imported[session.provider] += 1;
     } catch (error: unknown) {
       if (options.signal?.aborted) {
         throw error;
       }
       if (isAlreadyImportedError(error)) {
-        registered.keys.add(handleKey);
-        registered.keys.add(idKey);
+        registered.add(handleKey);
+        registered.add(idKey);
         result.skippedRegistered[session.provider] += 1;
         continue;
       }
@@ -493,96 +453,6 @@ async function discoverPiSessions(root: string, signal?: AbortSignal) {
   return { sessions, skippedInvalid, existingKeys };
 }
 
-async function cleanupDanglingAgents(
-  agents: RegisteredAgent[],
-  workspaceAgentCounts: Map<string, number>,
-  existingKeys: Set<string>,
-  deleteAgent: (agentId: string, signal?: AbortSignal) => Promise<void>,
-  archiveWorkspace: (
-    workspaceId: string,
-    signal?: AbortSignal,
-  ) => Promise<void>,
-  result: SyncResult,
-  signal?: AbortSignal,
-): Promise<void> {
-  const remainingByWorkspace = new Map(workspaceAgentCounts);
-
-  for (const agent of agents) {
-    throwIfAborted(signal);
-    if (await nativeSessionExists(agent, existingKeys)) {
-      continue;
-    }
-    if (agent.lastStatus === "running") {
-      result.skippedRunningDangling[agent.provider] += 1;
-      continue;
-    }
-    try {
-      await deleteAgent(agent.id, signal);
-      result.deletedDangling[agent.provider] += 1;
-      if (agent.workspaceId) {
-        remainingByWorkspace.set(
-          agent.workspaceId,
-          (remainingByWorkspace.get(agent.workspaceId) ?? 1) - 1,
-        );
-      }
-      console.info(
-        `[paseo-auto-sync] Deleted dangling ${agent.provider} agent ${agent.id}`,
-      );
-    } catch (error: unknown) {
-      if (signal?.aborted) {
-        throw error;
-      }
-      result.cleanupFailed[agent.provider] += 1;
-      console.error(
-        `[paseo-auto-sync] Failed to delete dangling ${agent.provider} agent ${agent.id}: ${errorMessage(error)}`,
-      );
-    }
-  }
-
-  // 只有该 workspace 的所有 agent 都成功删除后才归档，避免影响共享 workspace。
-  for (const [workspaceId, remaining] of remainingByWorkspace) {
-    if (remaining !== 0) {
-      continue;
-    }
-    try {
-      await archiveWorkspace(workspaceId, signal);
-      result.archivedEmptyWorkspaces += 1;
-    } catch (error: unknown) {
-      if (signal?.aborted) {
-        throw error;
-      }
-      result.workspaceArchiveFailed += 1;
-      console.error(
-        `[paseo-auto-sync] Failed to archive empty workspace ${workspaceId}: ${errorMessage(error)}`,
-      );
-    }
-  }
-}
-
-async function nativeSessionExists(
-  agent: RegisteredAgent,
-  existingKeys: Set<string>,
-): Promise<boolean> {
-  const handles = [agent.sessionId, agent.nativeHandle].filter(
-    (handle): handle is string => Boolean(handle),
-  );
-  if (handles.length === 0) {
-    return true;
-  }
-  if (
-    handles.some((handle) =>
-      existingKeys.has(sessionKey(agent.provider, handle)),
-    )
-  ) {
-    return true;
-  }
-  return Boolean(
-    agent.nativeHandle &&
-      path.isAbsolute(agent.nativeHandle) &&
-      (await isFile(agent.nativeHandle)),
-  );
-}
-
 async function importWithPaseoCli(
   session: LocalSession,
   signal?: AbortSignal,
@@ -631,26 +501,6 @@ async function importWithPaseoCli(
     ).catch(() => undefined);
     throw error;
   }
-}
-
-async function deleteWithPaseoCli(
-  agentId: string,
-  signal?: AbortSignal,
-): Promise<void> {
-  const paseo = await findPaseoCli();
-  await execJson(paseo, ["delete", agentId, "--json"], signal);
-}
-
-async function archiveWorkspaceWithPaseoCli(
-  workspaceId: string,
-  signal?: AbortSignal,
-): Promise<void> {
-  const paseo = await findPaseoCli();
-  await execJson(
-    paseo,
-    ["workspace", "archive", workspaceId, "--json"],
-    signal,
-  );
 }
 
 async function importAgentIntoWorkspace(
@@ -800,14 +650,6 @@ async function isDirectory(candidate: string): Promise<boolean> {
   }
 }
 
-async function isFile(candidate: string): Promise<boolean> {
-  try {
-    return (await stat(candidate)).isFile();
-  } catch {
-    return false;
-  }
-}
-
 function resolveConfiguredPath(
   value: string | undefined,
   fallback: string,
@@ -872,12 +714,62 @@ function resolveBatchSize(
 }
 
 function resolveSyncIntervalMs(configured: string | undefined): number {
-  const hours = Number(configured);
-  const boundedHours =
-    Number.isFinite(hours) && hours >= 1
-      ? Math.min(hours, MAX_SYNC_INTERVAL_HOURS)
-      : DEFAULT_SYNC_INTERVAL_HOURS;
-  return boundedHours * 60 * 60 * 1000;
+  const seconds = Number(configured);
+  const boundedSeconds =
+    Number.isFinite(seconds) && seconds >= 30
+      ? Math.min(seconds, MAX_SYNC_INTERVAL_SECONDS)
+      : DEFAULT_SYNC_INTERVAL_SECONDS;
+  return boundedSeconds * 1000;
+}
+
+async function readSyncScope(
+  env: NodeJS.ProcessEnv,
+  homeDir: string,
+): Promise<unknown> {
+  const paseoHome = resolveConfiguredPath(
+    env.PASEO_HOME,
+    path.join(homeDir, ".paseo"),
+    homeDir,
+  );
+  const configPath = path.join(
+    paseoHome, "plugin-data", "paseo-auto-sync", "config.json",
+  );
+  try {
+    return JSON.parse(await readFile(configPath, "utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { projects: [], providers: ["pi"] };
+    }
+    throw error;
+  }
+}
+
+function validateScope(
+  value: unknown,
+  homeDir: string,
+): { projects: string[]; providers: Provider[] } {
+  if (!value || typeof value !== "object") {
+    throw new Error("Auto-sync config must be an object with a projects whitelist");
+  }
+  const { projects, providers = ["pi"] } = value as Record<string, unknown>;
+  if (
+    !Array.isArray(projects) ||
+    !projects.every((p) =>
+      typeof p === "string" && (path.isAbsolute(p) || p.startsWith("~/")),
+    )
+  ) {
+    throw new Error("Auto-sync projects must be an array of absolute or ~/ paths");
+  }
+  if (
+    !Array.isArray(providers) ||
+    !providers.every((p) => p === "pi" || p === "codex")
+  ) {
+    throw new Error("Auto-sync providers must contain only pi or codex");
+  }
+  return {
+    projects: projects.map((p: string) => resolveConfiguredPath(p, p, homeDir)),
+    providers: providers as Provider[],
+  };
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

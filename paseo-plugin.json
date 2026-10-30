@@ -1,6 +1,8 @@
 {
   "id": "paseo-auto-sync",
+  "name": "Local session auto-sync",
+  "description": "Import local Pi sessions from an explicit project whitelist without deleting existing sessions.",
   "requirements": {
-    "paseo": ">=0.8.0"
+    "paseo": ">=0.13.2"
   }
 }
